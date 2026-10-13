@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """Tell a broken Survey123 form from a quiet one, and refuse to guess in a seasonal form's first year.
 
 A Survey123 form that stopped working and a form nobody has needed this month look
@@ -20,9 +20,9 @@ verdicts:
              little to say whether the silence is a season or a failure.
 
 The cadence test compares the silence with three times the 95th percentile of the gaps
-between submissions. Unless you state --seasonality none, it also asks whether the same
-stretch of the calendar one year ago was silent too, and calls a silence QUIET when it
-was. It reads only. The one thing it can write is a small JSON report, and that needs
+between submissions. Unless you state --seasonality none, a silence over that limit is
+also compared with the silence the form was in one year ago, on the same date. It is
+QUIET when the form was in a silence then that lasted at least three quarters as long. It reads only. The one thing it can write is a small JSON report, and that needs
 --apply.
 
     python formwatch.py --self-test
@@ -40,6 +40,7 @@ crash, which is never a finding.
 from __future__ import print_function
 
 import argparse
+import bisect
 import contextlib
 import datetime
 import getpass
@@ -83,6 +84,12 @@ MIN_SPAN_DAYS = 28
 # a judgement, not a measurement. Tune it against your own form's history.
 GAP_MULTIPLIER = 3.0
 GAP_QUANTILE = 0.95
+
+# A silence over the limit is QUIET when, one year ago on the same date, the form was
+# inside a silence at least this fraction as long. Seasons never end on the same day
+# two years running, so demanding an equal length would call a season that ended two
+# days early SILENT all winter. Three quarters is a judgement, like the multiplier.
+SEASON_MATCH = 0.75
 
 # The limit is never below this many days, so a form with sub-minute bursts is not
 # SILENT after an hour of quiet.
@@ -211,7 +218,7 @@ def judge(problems, refusal, stamps, undated, complete, now_ms, seasonality):
     """
     out = {"verdict": None, "reasons": [], "submissions": len(stamps),
            "undated": undated, "first": None, "last": None, "silence_days": None,
-           "limit_days": None, "year_ago_count": None, "seasonality": seasonality}
+           "limit_days": None, "year_ago_gap_days": None, "seasonality": seasonality}
 
     def done(verdict, *reasons):
         out["verdict"] = verdict
@@ -256,14 +263,18 @@ def judge(problems, refusal, stamps, undated, complete, now_ms, seasonality):
     limit = max(MIN_LIMIT_DAYS, GAP_MULTIPLIER * quantile(gaps, GAP_QUANTILE))
     out["limit_days"] = round(limit, 2)
     odd = silence / float(DAY_MS) > limit
-    if seasonality != "none":
-        lo, hi = now_ms - year - window, now_ms - year
-        ago = sum(1 for s in stamps if lo < s <= hi)
-        out["year_ago_count"] = ago
-        if ago == 0:
-            return done("QUIET", "the same %d day stretch a year ago had no "
-                        "submissions either, so this silence repeats a season"
-                        % int(math.ceil(window / float(DAY_MS))))
+    if odd and seasonality != "none":
+        # The first-year rule above guarantees a submission before the date a year
+        # ago, so stamps[idx - 1] exists. None after it means the silence is longer
+        # than a year, and no silence a year ago can explain that.
+        idx = bisect.bisect_right(stamps, now_ms - year)
+        if idx < len(stamps):
+            ago = stamps[idx] - stamps[idx - 1]
+            out["year_ago_gap_days"] = round(ago / float(DAY_MS), 2)
+            if ago >= SEASON_MATCH * silence:
+                return done("QUIET", "a year ago on this date the form was in a %d "
+                            "day silence, so this silence repeats a season"
+                            % int(ago // DAY_MS))
     if odd:
         return done("SILENT", "silent %.1f days against a limit of %.1f days (%g "
                     "times the 95th percentile gap)"
@@ -409,7 +420,8 @@ def _parse(argv):
     ap.add_argument("--now", help="treat this UTC time as now (YYYY-MM-DD or "
                                   "YYYY-MM-DDTHH:MM:SSZ)")
     ap.add_argument("--max-rows", dest="max_rows", type=int, default=MAX_ROWS,
-                    help="most rows to read (default %d)" % MAX_ROWS)
+                    help="about this many rows to read; the last page may add more "
+                         "(default %d)" % MAX_ROWS)
     ap.add_argument("--out", help="write the verdict as JSON to this new file")
     ap.add_argument("--apply", action="store_true",
                     help="write the --out file. Without it nothing is written.")
@@ -547,6 +559,28 @@ def _footer(h):
                + ["  FAILED: %s" % label for label in h.failed])
 
 
+@contextlib.contextmanager
+def _hermetic():
+    """Run with none of the caller's credentials or proxies in the environment.
+
+    The README tells a user to keep a token in FORMWATCH_TOKEN, so the self-test must
+    not read it. A proxy variable would also route the loopback stub through the
+    proxy, and send it any credential the stub receives. NO_PROXY=* keeps the Windows
+    registry proxy out too, because urllib consults the registry only when no
+    environment proxy setting exists.
+    """
+    saved = dict(os.environ)
+    for name in list(os.environ):
+        if name in (TOKEN_ENV, PASSWORD_ENV) or name.lower().endswith("_proxy"):
+            del os.environ[name]
+    os.environ["NO_PROXY"] = os.environ["no_proxy"] = "*"
+    try:
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+
+
 def _run_main(argv, env=None):
     """Run main() capturing both streams. Returns (code, stdout, stderr)."""
     out, err = io.StringIO(), io.StringIO()
@@ -639,6 +673,12 @@ def _start_stub(state):
 
 
 def self_test():
+    """Run the assertions with a scrubbed environment."""
+    with _hermetic():
+        return _self_test()
+
+
+def _self_test():
     """Assertions over the decision core, then every network path against a stub."""
     h = _Harness()
     check, raises, refuses = h.check, h.raises, h.refuses
@@ -731,11 +771,14 @@ def self_test():
                      seasonality)
 
     r = verdict(season, "2026-01-15")
-    check(r["verdict"] == "QUIET" and r["year_ago_count"] == 0,
+    check(r["verdict"] == "QUIET" and r["year_ago_gap_days"] == 290.0,
           "a seasonal form in its second winter is QUIET: last year was silent too")
     r = verdict(season, "2026-06-20")
-    check(r["verdict"] == "SILENT" and r["year_ago_count"] == 19,
+    check(r["verdict"] == "SILENT" and r["year_ago_gap_days"] == 1.0,
           "the same form with the season open and no submissions is SILENT")
+    check(verdict(season, "2026-06-03")["verdict"] == "SILENT",
+          "a season that opens two days late reads SILENT: a judgement call, listed "
+          "in the README limits")
     r = verdict(season, "2025-10-01")
     check(r["verdict"] == "QUIET", "a seasonal form in its first autumn after a full "
           "year of history is QUIET")
@@ -748,6 +791,72 @@ def self_test():
     check(verdict(season, "2026-01-15", "none")["verdict"] == "SILENT",
           "with --seasonality none the second winter is SILENT, because no season "
           "is allowed to explain it")
+
+    # a season that ends on another day each year, and a stray off-season row
+    early = daily("2024-06-01", 78) + daily("2025-06-01", 76)    # 2025 ends 2 days early
+    for day in ("2025-10-01", "2026-01-15", "2026-05-01"):
+        check(verdict(early, day)["verdict"] == "QUIET",
+              "a season that ended two days earlier than last year is QUIET on %s  "
+              "<-- pinned defect" % day)
+    stray = (daily("2024-06-01", 76) + [at("2024-11-20") + DAY_MS // 2]
+             + daily("2025-06-01", 76))
+    check(verdict(stray, "2026-01-15")["verdict"] == "QUIET",
+          "one off-season test row last winter does not turn this winter SILENT  "
+          "<-- pinned defect")
+    check(verdict(stray, "2026-05-01")["verdict"] == "SILENT",
+          "a stray off-season row can turn the last weeks of the next off season SILENT: "
+          "a limit, listed in the README")
+    closure = daily("2024-01-01", 354) + daily("2025-01-06", 348)   # shut 20 Dec to 5 Jan
+    check(verdict(closure, "2026-01-05")["verdict"] == "QUIET"
+          and verdict(closure, "2026-01-10")["verdict"] == "SILENT",
+          "a daily form that breaks as its yearly closure starts reads QUIET until the "
+          "closure's date a year ago has passed: a limit, listed in the README")
+    long_dead = daily("2022-01-01", 400)
+    r = verdict(long_dead, "2026-01-15")
+    check(r["verdict"] == "SILENT" and r["year_ago_gap_days"] is None,
+          "a form silent for over a year is SILENT: no silence a year ago can explain it")
+
+    # the year-ago silence must last SEASON_MATCH of this one, to the millisecond
+    base = daily("2024-01-01", 400)
+    holed = base[:41] + base[48:]                  # one 8 day gap at day 40.5 to 48.5
+    third = 921600000                              # 32/3 days: 0.75 of it is 8 days
+    check(judge([], None, holed, 0, True, holed[-1] + third, "unknown")["verdict"]
+          == "QUIET", "a year-ago silence exactly 0.75 as long as this one is QUIET")
+    check(judge([], None, holed, 0, True, holed[-1] + third + 1, "unknown")["verdict"]
+          == "SILENT", "one millisecond over 0.75 of the year-ago silence is SILENT")
+
+    # a submission exactly one year ago means the form was working then
+    on_edge = daily("2024-01-01", 406)
+    on_edge = on_edge[:41] + on_edge[48:]
+    check(judge([], None, on_edge, 0, True, on_edge[41] + YEAR_DAYS * DAY_MS,
+                "unknown")["verdict"] == "SILENT",
+          "a submission exactly one year before now ends the year-ago silence, so "
+          "this silence is SILENT  <-- pinned defect")
+
+    # exact boundaries of the gap percentile, the first-year rule and the span rule
+    gapped = [at("2025-01-01")]
+    for gap in [1] * 27 + [50] + [1]:
+        gapped.append(gapped[-1] + gap * DAY_MS)
+    check(judge([], None, gapped, 0, True, gapped[-1] + 20 * DAY_MS, "none")["verdict"]
+          == "SILENT", "the 95th percentile is taken from sorted gaps, so one long gap "
+          "among 29 does not lift the limit  <-- pinned defect")
+    year_plus = daily("2025-01-01", 366)
+    check(judge([], None, year_plus, 0, True, year_plus[-1] + 10 * DAY_MS,
+                "unknown")["verdict"] == "SILENT",
+          "a history of exactly a year plus the silence is enough to judge  "
+          "<-- pinned defect")
+    year_short = year_plus[:-1]
+    check(judge([], None, year_short, 0, True, year_short[-1] + 10 * DAY_MS,
+                "unknown")["verdict"] == "REFUSED",
+          "a history one day short of a year is REFUSED however long the silence")
+    span = daily("2025-01-01", 28) + [at("2025-01-29") + DAY_MS // 2] * 2
+    check(judge([], None, span, 0, True, span[-1] + DAY_MS, "none")["verdict"] == "QUIET",
+          "a history spanning exactly 28 days is enough for --seasonality none  "
+          "<-- pinned defect")
+    short = span[:-2] + [span[-3] + DAY_MS - 1000] * 2
+    check(judge([], None, short, 0, True, short[-1] + DAY_MS, "none")["verdict"]
+          == "REFUSED",
+          "a history spanning under 28 days is REFUSED for --seasonality none")
 
     steady = daily("2025-01-01", 400)
     last = steady[-1]
@@ -773,8 +882,9 @@ def self_test():
           "a floor of one day")
     check(judge([], None, hourly, 0, True, hourly[-1] + 25 * 3600000, "none")["verdict"]
           == "SILENT", "twenty five quiet hours in an hourly form are SILENT")
-    check(judge([], None, steady, 0, True, last, "unknown")["year_ago_count"] == 1,
-          "a submission this minute still compares a one day stretch a year ago  "
+    r = judge([], None, steady, 0, True, last, "unknown")
+    check(r["verdict"] == "QUIET" and r["year_ago_gap_days"] is None,
+          "a submission this minute is QUIET and needs no year-ago comparison  "
           "<-- pinned defect")
     burst = [at("2026-03-01") + n * 1000 for n in range(40)]
     r = judge([], None, burst, 0, True, at("2026-03-15"), "none")
@@ -960,6 +1070,7 @@ def self_test():
               "stub: username and password get a token, and neither is printed")
         check(state["log"][0][0].endswith("/sharing/rest/generateToken")
               and state["log"][0][1]["referer"] == base
+              and state["log"][0][1]["expiration"] == "30"
               and state["log"][0][1]["client"] == "referer",
               "stub: generateToken is called first with client and referer")
         state["login"] = ("builder", "other-pw")
@@ -1005,6 +1116,9 @@ def self_test():
               "with --apply the verdict is written as JSON")
         check("TOKEN-9f3a" not in written and "hunter2" not in written,
               "the report holds no credential")
+        keys = list(json.loads(written))
+        check(keys == sorted(keys) and "year_ago_gap_days" in keys,
+              "the report lists its keys in sorted order")
         code, out, err = go(["--now", "2026-01-15", "--out", report, "--apply"], env)
         check(code == 2 and "exists" in err, "an existing report is never overwritten")
         check(sorted(os.listdir(tmp)) == ["verdict.json"],
@@ -1023,8 +1137,28 @@ def self_test():
         check(code == 70 and "not a finding" in err and "TOKEN-9f3a" not in err,
               "an unexpected crash exits 70 with the token redacted")
 
-        # ---- the real clock, with no --now
+        # ---- the caller's own credentials and proxy never reach the stub
         state["token"] = None
+        outer = {TOKEN_ENV: "REAL-outer-token", PASSWORD_ENV: "REAL-outer-pw",
+                 "HTTP_PROXY": "http://127.0.0.1:9", "http_proxy": "http://127.0.0.1:9"}
+        os.environ.update(outer)
+        try:
+            with _hermetic():
+                bare_env = (TOKEN_ENV not in os.environ and PASSWORD_ENV not in os.environ
+                            and "HTTP_PROXY" not in os.environ
+                            and urllib.request.getproxies() == {"no": "*"})
+                code, out, err = go(["--now", "2026-01-15"])
+            restored = os.environ.get(TOKEN_ENV) == "REAL-outer-token"
+        finally:
+            for name in outer:
+                os.environ.pop(name, None)
+        check(bare_env and restored, "the self-test environment holds no token, no "
+              "password and no proxy, and gives them back afterwards  <-- pinned defect")
+        check(code == 0 and state["log"] and all("token" not in f for _p, f in state["log"]),
+              "a token and a proxy in the caller's environment never reach the stub  "
+              "<-- pinned defect")
+
+        # ---- the real clock, with no --now
         state["rows"] = [{"OBJECTID": i + 1, "CreationDate": ms}
                          for i, ms in enumerate(daily("2001-01-01", 700))]
         code, out, err = go([])
@@ -1033,10 +1167,10 @@ def self_test():
     finally:
         server.shutdown()
         server.server_close()
+        shutil.rmtree(tmp)
     code, out, err = _run_main(["--layer-url", url, "--now", "2026-01-15"])
     check(code == 2 and err.startswith("error: "),
           "a service that is not listening exits 2")
-    shutil.rmtree(tmp)
 
     # ---- the harness itself, so a broken tool turns this self-test red
     probe = _Harness()
